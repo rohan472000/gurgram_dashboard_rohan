@@ -128,5 +128,9 @@ def update_map(slider_index, selected_param):
     fig.update_layout(margin={"r":0,"t":40,"l":0,"b":0}, title=f"{selected_param} on {date.strftime('%d-%b-%Y')}")
     return fig
 
-if __name__ == '__main__':
-    app.run_server(debug=True)
+import os
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8050))
+    app.run_server(host="0.0.0.0", port=port, debug=False)
+
