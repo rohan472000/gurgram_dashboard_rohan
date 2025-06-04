@@ -9,7 +9,9 @@ from scipy.spatial import cKDTree
 import dash
 from dash import dcc, html
 from dash.dependencies import Input, Output
-from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
 import os
 
 boundary = gpd.read_file("GMDA - Boundary Georef/extracted_kml/doc.kml", driver="KML").to_crs(epsg=4326)
@@ -56,7 +58,7 @@ daily_obs_df = all_df.groupby(['Timestamp', 'Sensor_Location', 'Latitude', 'Long
 }).reset_index()
 dates = sorted(daily_obs_df['Timestamp'].unique())
 
-def idw(sensor_df, grid_gdf, value_col='value', power=2):
+def iidw(sensor_df, grid_gdf, value_col='value', power=2):
     points = sensor_df[['Longitude', 'Latitude']].values
     values = sensor_df[value_col].values
     grid_coords = np.array([geom.centroid.coords[0] for geom in grid_gdf.geometry])
@@ -68,22 +70,92 @@ def idw(sensor_df, grid_gdf, value_col='value', power=2):
     grid_gdf = grid_gdf.copy()
     grid_gdf[value_col] = interpolated
     return grid_gdf
+    
+def idw(sensor_df, grid_gdf, value_col='value', power=2):
+    points = sensor_df[['Longitude', 'Latitude']].values
+    values = sensor_df[value_col].values
+    grid_coords = np.array([geom.centroid.coords[0] for geom in grid_gdf.geometry])
+    
+    k = min(5, len(points))
+    tree = cKDTree(points)
+    dist, idx = tree.query(grid_coords, k=k, distance_upper_bound=np.inf)
 
-pred_df = daily_obs_df.dropna(subset=['PM2.5', 'Temperature', 'Humidity'])
-model = LinearRegression()
-model.fit(pred_df[['Temperature', 'Humidity']], pred_df['PM2.5'])
+    if k == 1:
+        dist = dist[:, np.newaxis]
+        idx = idx[:, np.newaxis]
 
-latest_temp_hum = daily_obs_df.groupby(['Latitude', 'Longitude'])[['Temperature', 'Humidity']].last().dropna()
-future_predictions = []
-for i in range(1, 8):
-    date = daily_obs_df['Timestamp'].max() + pd.Timedelta(days=i)
-    preds = model.predict(latest_temp_hum[['Temperature', 'Humidity']])
-    pred_df_day = latest_temp_hum.copy()
-    pred_df_day['value'] = preds
-    pred_df_day['Timestamp'] = date
-    future_predictions.append(pred_df_day.reset_index())
+    mask = np.isinf(dist)
+    dist[mask] = 1e-6  
+    weights = 1 / (dist ** power + 1e-6)
+    weights[mask] = 0  
+    weights_sum = weights.sum(axis=1)[:, None]
+    weights = np.divide(weights, weights_sum, out=np.zeros_like(weights), where=weights_sum != 0)
 
-future_df = pd.concat(future_predictions)
+    interpolated = np.sum(weights * values[idx], axis=1)
+
+    grid_gdf = grid_gdf.copy()
+    grid_gdf[value_col] = interpolated
+    return grid_gdf
+
+def generate_lstm_predictions(df, forecast_days=7):
+    predictions_all = []
+    for (lat, lon), group_df in df.groupby(['Latitude', 'Longitude']):
+        group_df = group_df.sort_values('Timestamp')
+        features = ['PM2.5', 'Temperature', 'Humidity']
+
+        if group_df[features].isnull().any().any() or len(group_df) < 15:
+            continue
+
+        scaler = MinMaxScaler()
+        scaled_data = scaler.fit_transform(group_df[features])
+        X, y = [], []
+        seq_len = 7
+        for i in range(len(scaled_data) - seq_len):
+            X.append(scaled_data[i:i + seq_len])
+            y.append(scaled_data[i + seq_len][0])
+
+        X, y = np.array(X), np.array(y)
+        if len(X) < 5:
+            continue
+
+        model = Sequential([
+            LSTM(32, activation='relu', input_shape=(X.shape[1], X.shape[2])),
+            Dense(1)
+        ])
+        model.compile(optimizer='adam', loss='mse')
+        model.fit(X, y, epochs=5, verbose=2)
+
+        input_seq = scaled_data[-seq_len:]
+        future_preds = []
+        for _ in range(forecast_days):
+            pred = model.predict(input_seq.reshape(1, seq_len, 3), verbose=0)[0][0]
+            future_preds.append(pred)
+            next_input = np.array([pred, input_seq[-1][1], input_seq[-1][2]])
+            input_seq = np.vstack([input_seq[1:], next_input])
+
+        restored_preds = scaler.inverse_transform(
+            np.column_stack([future_preds,
+                             [input_seq[-1][1]] * forecast_days,
+                             [input_seq[-1][2]] * forecast_days])
+        )[:, 0]
+
+        # dates = pd.date_range(start=group_df['Timestamp'].max() + pd.Timedelta(days=1), periods=forecast_days)
+        forecast_start = df['Timestamp'].max() + pd.Timedelta(days=1)
+        dates = pd.date_range(start=forecast_start, periods=forecast_days)
+
+        pred_df = pd.DataFrame({
+            'Latitude': lat,
+            'Longitude': lon,
+            'Temperature': input_seq[-1][1],
+            'Humidity': input_seq[-1][2],
+            'value': restored_preds,
+            'Timestamp': dates
+        })
+        predictions_all.append(pred_df)
+
+    return pd.concat(predictions_all, ignore_index=True)
+
+future_df = generate_lstm_predictions(daily_obs_df)
 predicted_dates = sorted(future_df['Timestamp'].unique())
 
 app = dash.Dash(__name__)
@@ -95,10 +167,10 @@ app.layout = html.Div([
         dcc.Dropdown(
             id="parameter-dropdown",
             options=[
-                {'label': 'PM2.5', 'value': 'PM2.5'},
-                {'label': 'Temperature', 'value': 'Temperature'},
-                {'label': 'Humidity', 'value': 'Humidity'},
-                {'label': 'Predicted PM2.5', 'value': 'Predicted PM2.5'}
+                {'label': 'PM2.5 (µg/m³)', 'value': 'PM2.5'},
+                {'label': 'Temperature (°C)', 'value': 'Temperature'},
+                {'label': 'Humidity (%)', 'value': 'Humidity'},
+                {'label': 'Predicted PM2.5 (µg/m³)', 'value': 'Predicted PM2.5'}
             ],
             value='PM2.5',
             clearable=False
@@ -118,14 +190,23 @@ app.layout = html.Div([
                 id="historical-slider-wrapper"
             ),
             html.Div(
+                # dcc.Slider(
+                #     id="date-slider-predicted",
+                #     min=0,
+                #     max=len(predicted_dates) - 1,
+                #     step=1,
+                #     marks={i: predicted_dates[i].strftime('%d-%b') for i in range(len(predicted_dates))},
+                #     value=0
+                # )
                 dcc.Slider(
                     id="date-slider-predicted",
                     min=0,
                     max=len(predicted_dates) - 1,
                     step=1,
-                    marks={i: predicted_dates[i].strftime('%d-%b') for i in range(len(predicted_dates))},
+                    marks={i: predicted_dates[i].strftime('%d-%b') for i in range(0, len(predicted_dates), max(1, len(predicted_dates)//7))},
                     value=0
-                ),
+                )
+                ,
                 id="predicted-slider-wrapper",
                 style={"display": "none"}
             )
@@ -177,6 +258,13 @@ def update_map(selected_param, hist_index, pred_index):
         "Predicted PM2.5": (0, 500)
     }[selected_param]
 
+    unit = {
+        "PM2.5": "µg/m³",
+        "Temperature": "°C",
+        "Humidity": "%",
+        "Predicted PM2.5": "µg/m³"
+    }[selected_param]
+
     fig = px.choropleth_mapbox(
         grid_with_preds,
         geojson=json.loads(grid_with_preds.to_json()),
@@ -190,7 +278,8 @@ def update_map(selected_param, hist_index, pred_index):
         opacity=0.6,
         height=700
     )
-    fig.update_layout(margin={"r":0,"t":40,"l":0,"b":0}, title=f"{selected_param} on {date.strftime('%d-%b-%Y')}")
+    fig.update_layout(margin={"r":0,"t":40,"l":0,"b":0}, title=f"{selected_param} on {date.strftime('%d-%b-%Y')} ({unit})")
+    fig.update_coloraxes(colorbar_title=unit)
     return fig
 
 if __name__ == "__main__":
