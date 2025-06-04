@@ -9,6 +9,8 @@ from scipy.spatial import cKDTree
 import dash
 from dash import dcc, html
 from dash.dependencies import Input, Output
+from sklearn.linear_model import LinearRegression
+import os
 
 boundary = gpd.read_file("GMDA - Boundary Georef/extracted_kml/doc.kml", driver="KML").to_crs(epsg=4326)
 xmin, ymin, xmax, ymax = boundary.total_bounds
@@ -67,55 +69,118 @@ def idw(sensor_df, grid_gdf, value_col='value', power=2):
     grid_gdf[value_col] = interpolated
     return grid_gdf
 
-app = dash.Dash(__name__)
+pred_df = daily_obs_df.dropna(subset=['PM2.5', 'Temperature', 'Humidity'])
+model = LinearRegression()
+model.fit(pred_df[['Temperature', 'Humidity']], pred_df['PM2.5'])
 
+latest_temp_hum = daily_obs_df.groupby(['Latitude', 'Longitude'])[['Temperature', 'Humidity']].last().dropna()
+future_predictions = []
+for i in range(1, 8):
+    date = daily_obs_df['Timestamp'].max() + pd.Timedelta(days=i)
+    preds = model.predict(latest_temp_hum[['Temperature', 'Humidity']])
+    pred_df_day = latest_temp_hum.copy()
+    pred_df_day['value'] = preds
+    pred_df_day['Timestamp'] = date
+    future_predictions.append(pred_df_day.reset_index())
+
+future_df = pd.concat(future_predictions)
+predicted_dates = sorted(future_df['Timestamp'].unique())
+
+app = dash.Dash(__name__)
 app.layout = html.Div([
     html.H2("Daily Interpolated Air Quality - Gurugram", style={'textAlign': 'center'}),
+
     html.Div([
-        html.Label("Select Date:"),
-        dcc.Slider(
-            id="date-slider",
-            min=0,
-            max=len(dates) - 1,
-            step=1,
-            marks={i: dates[i].strftime('%d-%b') for i in range(0, len(dates), max(1, len(dates) // 10))},
-            value=0
-        ),
         html.Label("Select Variable:"),
         dcc.Dropdown(
             id="parameter-dropdown",
-            options=[{'label': col, 'value': col} for col in ['PM2.5', 'Temperature', 'Humidity']],
+            options=[
+                {'label': 'PM2.5', 'value': 'PM2.5'},
+                {'label': 'Temperature', 'value': 'Temperature'},
+                {'label': 'Humidity', 'value': 'Humidity'},
+                {'label': 'Predicted PM2.5', 'value': 'Predicted PM2.5'}
+            ],
             value='PM2.5',
             clearable=False
-        )
+        ),
+        html.Br(),
+
+        html.Div(id="slider-container", children=[
+            html.Div(
+                dcc.Slider(
+                    id="date-slider-historical",
+                    min=0,
+                    max=len(dates) - 1,
+                    step=1,
+                    marks={i: dates[i].strftime('%d-%b') for i in range(0, len(dates), max(1, len(dates)//10))},
+                    value=0
+                ),
+                id="historical-slider-wrapper"
+            ),
+            html.Div(
+                dcc.Slider(
+                    id="date-slider-predicted",
+                    min=0,
+                    max=len(predicted_dates) - 1,
+                    step=1,
+                    marks={i: predicted_dates[i].strftime('%d-%b') for i in range(len(predicted_dates))},
+                    value=0
+                ),
+                id="predicted-slider-wrapper",
+                style={"display": "none"}
+            )
+        ])
     ], style={'padding': '10px 50px'}),
+
     dcc.Graph(id="map-plot")
 ])
 
 @app.callback(
-    Output("map-plot", "figure"),
-    Input("date-slider", "value"),
+    Output("historical-slider-wrapper", "style"),
+    Output("predicted-slider-wrapper", "style"),
     Input("parameter-dropdown", "value")
 )
-def update_map(slider_index, selected_param):
-    date = dates[slider_index]
-    df = daily_obs_df[daily_obs_df['Timestamp'] == date].dropna(subset=[selected_param, 'Latitude', 'Longitude'])
+def toggle_slider(selected_param):
+    if selected_param == "Predicted PM2.5":
+        return {"display": "none"}, {"display": "block"}
+    else:
+        return {"display": "block"}, {"display": "none"}
+
+@app.callback(
+    Output("map-plot", "figure"),
+    Input("parameter-dropdown", "value"),
+    Input("date-slider-historical", "value"),
+    Input("date-slider-predicted", "value")
+)
+def update_map(selected_param, hist_index, pred_index):
+    if selected_param == 'Predicted PM2.5':
+        date = predicted_dates[pred_index]
+        df = future_df[future_df['Timestamp'] == date][['Latitude', 'Longitude', 'value']]
+    else:
+        date = dates[hist_index]
+        df = daily_obs_df[daily_obs_df['Timestamp'] == date].dropna(subset=[selected_param, 'Latitude', 'Longitude'])
+        df = df.rename(columns={selected_param: 'value'})
+        df = df[['Latitude', 'Longitude', 'value']]
+
     if df.empty:
-        return px.scatter_mapbox()
-    df = df.rename(columns={selected_param: 'value'})
-    interpolated = idw(df, clipped_grid, 'value')
-    interpolated = interpolated.dropna(subset=['value'])
+        return px.scatter_mapbox(
+            lat=[], lon=[], zoom=10.5, mapbox_style="carto-positron",
+            center={"lat": 28.45, "lon": 77.02}, height=700
+        ).update_layout(margin={"r":0,"t":40,"l":0,"b":0}, title="No data available for selected date")
+
+    grid_with_preds = idw(df, clipped_grid, 'value')
 
     vmin, vmax = {
         "PM2.5": (0, 500),
         "Temperature": (0, 50),
-        "Humidity": (0, 100)
+        "Humidity": (0, 100),
+        "Predicted PM2.5": (0, 500)
     }[selected_param]
 
     fig = px.choropleth_mapbox(
-        interpolated,
-        geojson=json.loads(interpolated.to_json()),
-        locations=interpolated.index,
+        grid_with_preds,
+        geojson=json.loads(grid_with_preds.to_json()),
+        locations=grid_with_preds.index,
         color="value",
         color_continuous_scale="YlOrRd",
         range_color=(vmin, vmax),
@@ -128,9 +193,8 @@ def update_map(slider_index, selected_param):
     fig.update_layout(margin={"r":0,"t":40,"l":0,"b":0}, title=f"{selected_param} on {date.strftime('%d-%b-%Y')}")
     return fig
 
-import os
-
 if __name__ == "__main__":
+    is_render = os.environ.get("RENDER", None)
     port = int(os.environ.get("PORT", 8050))
-    app.run(host="0.0.0.0", port=port, debug=False)
-
+    host = "0.0.0.0" if is_render else "127.0.0.1"
+    app.run(host=host, port=port, debug=True)
