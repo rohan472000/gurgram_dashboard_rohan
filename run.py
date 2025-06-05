@@ -14,6 +14,7 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 import os
 
+# === Load Boundary and Create Grid ===
 boundary = gpd.read_file("GMDA - Boundary Georef/extracted_kml/doc.kml", driver="KML").to_crs(epsg=4326)
 xmin, ymin, xmax, ymax = boundary.total_bounds
 grid_size = 0.009
@@ -24,12 +25,20 @@ grid = gpd.GeoDataFrame(grid_cells, columns=['geometry'], crs=boundary.crs)
 clipped_grid = gpd.overlay(grid, boundary, how='intersection')
 clipped_grid['zone_id'] = range(1, len(clipped_grid) + 1)
 
+# === Load and Process Sensor Data ===
+allowed_qrcodes = {'5WZHYW9W','ELLUJP9P','FVPFR6N8','HN1ZDFQ4','HQ9YMO1D','IR3BO10Z','LBMZO9OW','N3C5VR4U','NB8UUJGI','ORTZ0IBL','Q4XCUI8G','V3O3XQX7','Z4164TFS','ELLUJP9P'}  
 file_paths = glob.glob("filtered_master_file_api/*.csv")
 df_list = []
 for file_path in file_paths:
+    
     parts = file_path.split("_")
     if len(parts) < 7:
         continue
+        
+    # qrcode = parts[4].replace(".csv", "")  
+    # if qrcode not in allowed_qrcodes:
+    #     continue    
+        
     sensor_name = parts[4]
     thing_id = parts[6]
     df = pd.read_csv(file_path)
@@ -58,24 +67,21 @@ daily_obs_df = all_df.groupby(['Timestamp', 'Sensor_Location', 'Latitude', 'Long
 }).reset_index()
 dates = sorted(daily_obs_df['Timestamp'].unique())
 
-def iidw(sensor_df, grid_gdf, value_col='value', power=2):
-    points = sensor_df[['Longitude', 'Latitude']].values
-    values = sensor_df[value_col].values
-    grid_coords = np.array([geom.centroid.coords[0] for geom in grid_gdf.geometry])
-    tree = cKDTree(points)
-    dist, idx = tree.query(grid_coords, k=min(5, len(points)), distance_upper_bound=np.inf)
-    weights = 1 / (dist ** power + 1e-6)
-    weights = weights / weights.sum(axis=1)[:, None]
-    interpolated = np.sum(weights * values[idx], axis=1)
-    grid_gdf = grid_gdf.copy()
-    grid_gdf[value_col] = interpolated
-    return grid_gdf
-    
+# === Prediction Stub ===
+predicted_dates = pd.date_range(start='2025-06-01', periods=7)
+future_df = pd.DataFrame({
+    'Latitude': np.random.uniform(28.35, 28.50, 100),
+    'Longitude': np.random.uniform(76.90, 77.10, 100),
+    'value': np.random.uniform(5, 300, 100),
+    'Timestamp': np.random.choice(predicted_dates, 100)
+})
+
+# === IDW Interpolation ===
 def idw(sensor_df, grid_gdf, value_col='value', power=2):
     points = sensor_df[['Longitude', 'Latitude']].values
     values = sensor_df[value_col].values
     grid_coords = np.array([geom.centroid.coords[0] for geom in grid_gdf.geometry])
-    
+
     k = min(5, len(points))
     tree = cKDTree(points)
     dist, idx = tree.query(grid_coords, k=k, distance_upper_bound=np.inf)
@@ -85,83 +91,21 @@ def idw(sensor_df, grid_gdf, value_col='value', power=2):
         idx = idx[:, np.newaxis]
 
     mask = np.isinf(dist)
-    dist[mask] = 1e-6  
+    dist[mask] = 1e-6
     weights = 1 / (dist ** power + 1e-6)
-    weights[mask] = 0  
+    weights[mask] = 0
     weights_sum = weights.sum(axis=1)[:, None]
     weights = np.divide(weights, weights_sum, out=np.zeros_like(weights), where=weights_sum != 0)
 
     interpolated = np.sum(weights * values[idx], axis=1)
-
     grid_gdf = grid_gdf.copy()
     grid_gdf[value_col] = interpolated
     return grid_gdf
 
-def generate_lstm_predictions(df, forecast_days=7):
-    predictions_all = []
-    for (lat, lon), group_df in df.groupby(['Latitude', 'Longitude']):
-        group_df = group_df.sort_values('Timestamp')
-        features = ['PM2.5', 'Temperature', 'Humidity']
-
-        if group_df[features].isnull().any().any() or len(group_df) < 15:
-            continue
-
-        scaler = MinMaxScaler()
-        scaled_data = scaler.fit_transform(group_df[features])
-        X, y = [], []
-        seq_len = 7
-        for i in range(len(scaled_data) - seq_len):
-            X.append(scaled_data[i:i + seq_len])
-            y.append(scaled_data[i + seq_len][0])
-
-        X, y = np.array(X), np.array(y)
-        if len(X) < 5:
-            continue
-
-        model = Sequential([
-            LSTM(32, activation='relu', input_shape=(X.shape[1], X.shape[2])),
-            Dense(1)
-        ])
-        model.compile(optimizer='adam', loss='mse')
-        model.fit(X, y, epochs=5, verbose=2)
-
-        input_seq = scaled_data[-seq_len:]
-        future_preds = []
-        for _ in range(forecast_days):
-            pred = model.predict(input_seq.reshape(1, seq_len, 3), verbose=0)[0][0]
-            future_preds.append(pred)
-            next_input = np.array([pred, input_seq[-1][1], input_seq[-1][2]])
-            input_seq = np.vstack([input_seq[1:], next_input])
-
-        restored_preds = scaler.inverse_transform(
-            np.column_stack([future_preds,
-                             [input_seq[-1][1]] * forecast_days,
-                             [input_seq[-1][2]] * forecast_days])
-        )[:, 0]
-
-        # dates = pd.date_range(start=group_df['Timestamp'].max() + pd.Timedelta(days=1), periods=forecast_days)
-        forecast_start = df['Timestamp'].max() + pd.Timedelta(days=1)
-        dates = pd.date_range(start=forecast_start, periods=forecast_days)
-
-        pred_df = pd.DataFrame({
-            'Latitude': lat,
-            'Longitude': lon,
-            'Temperature': input_seq[-1][1],
-            'Humidity': input_seq[-1][2],
-            'value': restored_preds,
-            'Timestamp': dates
-        })
-        predictions_all.append(pred_df)
-
-    return pd.concat(predictions_all, ignore_index=True)
-
-future_df = generate_lstm_predictions(daily_obs_df)
-predicted_dates = sorted(future_df['Timestamp'].unique())
-
+# === Dash App Setup ===
 app = dash.Dash(__name__)
 app.layout = html.Div([
     html.H2("Daily Interpolated Air Quality - Gurugram", style={'textAlign': 'center'}),
-
     html.Div([
         html.Label("Select Variable:"),
         dcc.Dropdown(
@@ -176,46 +120,27 @@ app.layout = html.Div([
             clearable=False
         ),
         html.Br(),
-
         html.Div(id="slider-container", children=[
-            html.Div(
-                dcc.Slider(
-                    id="date-slider-historical",
-                    min=0,
-                    max=len(dates) - 1,
-                    step=1,
-                    marks={i: dates[i].strftime('%d-%b') for i in range(0, len(dates), max(1, len(dates)//10))},
-                    value=0
-                ),
-                id="historical-slider-wrapper"
-            ),
-            html.Div(
-                # dcc.Slider(
-                #     id="date-slider-predicted",
-                #     min=0,
-                #     max=len(predicted_dates) - 1,
-                #     step=1,
-                #     marks={i: predicted_dates[i].strftime('%d-%b') for i in range(len(predicted_dates))},
-                #     value=0
-                # )
-                dcc.Slider(
-                    id="date-slider-predicted",
-                    min=0,
-                    max=len(predicted_dates) - 1,
-                    step=1,
-                    marks={i: predicted_dates[i].strftime('%d-%b') for i in range(0, len(predicted_dates), max(1, len(predicted_dates)//7))},
-                    value=0
-                )
-                ,
-                id="predicted-slider-wrapper",
-                style={"display": "none"}
-            )
+            html.Div(dcc.Slider(
+                id="date-slider-historical",
+                min=0,
+                max=len(dates) - 1,
+                step=1,
+                marks={i: dates[i].strftime('%d-%b') for i in range(0, len(dates), max(1, len(dates)//10))},
+                value=0), id="historical-slider-wrapper", style={"display": "block"}),
+            html.Div(dcc.Slider(
+                id="date-slider-predicted",
+                min=0,
+                max=len(predicted_dates) - 1,
+                step=1,
+                marks={i: predicted_dates[i].strftime('%d-%b') for i in range(0, len(predicted_dates), max(1, len(predicted_dates)//7))},
+                value=0), id="predicted-slider-wrapper", style={"display": "none"})
         ])
     ], style={'padding': '10px 50px'}),
-
     dcc.Graph(id="map-plot")
 ])
 
+# === Toggle Sliders ===
 @app.callback(
     Output("historical-slider-wrapper", "style"),
     Output("predicted-slider-wrapper", "style"),
@@ -227,6 +152,7 @@ def toggle_slider(selected_param):
     else:
         return {"display": "block"}, {"display": "none"}
 
+# === Update Map Callback ===
 @app.callback(
     Output("map-plot", "figure"),
     Input("parameter-dropdown", "value"),
@@ -244,42 +170,71 @@ def update_map(selected_param, hist_index, pred_index):
         df = df[['Latitude', 'Longitude', 'value']]
 
     if df.empty:
-        return px.scatter_mapbox(
-            lat=[], lon=[], zoom=10.5, mapbox_style="carto-positron",
-            center={"lat": 28.45, "lon": 77.02}, height=700
-        ).update_layout(margin={"r":0,"t":40,"l":0,"b":0}, title="No data available for selected date")
+        return px.scatter_mapbox(lat=[], lon=[], zoom=10.5, mapbox_style="carto-positron",
+                                 center={"lat": 28.45, "lon": 77.02}, height=700)
 
     grid_with_preds = idw(df, clipped_grid, 'value')
+    unit = {"PM2.5": "µg/m³", "Temperature": "°C", "Humidity": "%", "Predicted PM2.5": "µg/m³"}[selected_param]
 
-    vmin, vmax = {
-        "PM2.5": (0, 500),
-        "Temperature": (0, 50),
-        "Humidity": (0, 100),
-        "Predicted PM2.5": (0, 500)
-    }[selected_param]
+    if selected_param in ["PM2.5", "Predicted PM2.5"]:
+        bins = [0, 12, 35.4, 55.4, 150.4, 250.4, 500]
+        range_labels = ['0–12', '12.1–35.4', '35.5–55.4', '55.5–150.4', '150.5–250.4', '250.5+']
+        label_to_color = {
+            '0–12': 'green',
+            '12.1–35.4': 'yellow',
+            '35.5–55.4': 'orange',
+            '55.5–150.4': 'red',
+            '150.5–250.4': 'purple',
+            '250.5+': 'maroon'
+        }
 
-    unit = {
-        "PM2.5": "µg/m³",
-        "Temperature": "°C",
-        "Humidity": "%",
-        "Predicted PM2.5": "µg/m³"
-    }[selected_param]
+        grid_with_preds['Category'] = pd.cut(grid_with_preds['value'], bins=bins, labels=range_labels, include_lowest=True)
+        grid_with_preds['hover_text'] = 'Value: ' + grid_with_preds['value'].round(1).astype(str) + ' ' + unit + '<br>Bin: ' + grid_with_preds['Category'].astype(str)
 
-    fig = px.choropleth_mapbox(
-        grid_with_preds,
-        geojson=json.loads(grid_with_preds.to_json()),
-        locations=grid_with_preds.index,
-        color="value",
-        color_continuous_scale="YlOrRd",
-        range_color=(vmin, vmax),
-        mapbox_style="carto-positron",
-        center={"lat": 28.45, "lon": 77.02},
-        zoom=10.5,
-        opacity=0.6,
-        height=700
-    )
-    fig.update_layout(margin={"r":0,"t":40,"l":0,"b":0}, title=f"{selected_param} on {date.strftime('%d-%b-%Y')} ({unit})")
-    fig.update_coloraxes(colorbar_title=unit)
+        # Ensure all categories appear in legend
+        dummy_df = pd.DataFrame({
+            'geometry': [None]*len(range_labels),
+            'Category': range_labels,
+            'hover_text': ['']*len(range_labels),
+            'value': [0]*len(range_labels)
+        })
+        full_df = pd.concat([grid_with_preds, dummy_df], ignore_index=True)
+
+        fig = px.choropleth_mapbox(
+            full_df,
+            geojson=json.loads(clipped_grid.to_json()),
+            locations=full_df.index,
+            color="Category",
+            color_discrete_map=label_to_color,
+            hover_name="hover_text",
+            mapbox_style="carto-positron",
+            center={"lat": 28.45, "lon": 77.02},
+            zoom=10.5,
+            opacity=0.6,
+            height=700,
+            category_orders={"Category": range_labels}
+        )
+        fig.update_layout(title=f"{selected_param} on {date.strftime('%d-%b-%Y')} ({unit})",
+                          legend_title="PM2.5 Bins (µg/m³)",
+                          legend=dict(itemsizing='constant'))
+    else:
+        vmin, vmax = {"Temperature": (0, 50), "Humidity": (0, 100)}[selected_param]
+        fig = px.choropleth_mapbox(
+            grid_with_preds,
+            geojson=json.loads(grid_with_preds.to_json()),
+            locations=grid_with_preds.index,
+            color="value",
+            color_continuous_scale="YlOrRd",
+            range_color=(vmin, vmax),
+            mapbox_style="carto-positron",
+            center={"lat": 28.45, "lon": 77.02},
+            zoom=10.5,
+            opacity=0.6,
+            height=700
+        )
+        fig.update_coloraxes(colorbar_title=unit)
+        fig.update_layout(title=f"{selected_param} on {date.strftime('%d-%b-%Y')} ({unit})")
+
     return fig
 
 if __name__ == "__main__":
